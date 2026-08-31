@@ -1,47 +1,48 @@
-# syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.26.2-alpine AS builder
+[cite: 1]ARG PYTHON_VERSION=3.11
 
-ARG TARGETOS
-ARG TARGETARCH
+FROM ghcr.io/astral-sh/uv:python$PYTHON_VERSION-bookworm-slim AS builder
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
 
-RUN apk update && apk add --no-cache make git openssl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    python3-dev \
+    libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-RUN git clone --depth 1 https://github.com/PasarGuard/node.git .
-RUN go mod download
+ENV UV_PYTHON_DOWNLOADS=0
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} make NAME=main build
-RUN GOOS=${TARGETOS} GOARCH=${TARGETARCH} make install_xray
+WORKDIR /build
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,source=uv.lock,target=uv.lock \
+    --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    uv sync --frozen --no-install-project --no-dev
+ADD . /build
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
 
-# ساخت گواهی خودامضا (self-signed) که هم داخل ایمیج نود می‌ماند (برای TLS)
-# و هم محتوایش باید در فیلد "Server CA" پنل کپی شود.
-# دامنه TCP Proxy که Railway به این سرویس می‌دهد باید اینجا باشد وگرنه
-# پنل هنگام اتصال خطای "Hostname mismatch" می‌دهد.
-ARG NODE_DOMAIN=hayabusa.proxy.rlwy.net
-RUN mkdir -p /src/certs && \
-    openssl req -x509 -newkey ec \
-        -pkeyopt ec_paramgen_curve:P-256 \
-        -keyout /src/certs/ssl_key.pem \
-        -out /src/certs/ssl_cert.pem \
-        -days 3650 -nodes \
-        -subj "/CN=${NODE_DOMAIN}" \
-        -addext "subjectAltName = DNS:${NODE_DOMAIN},DNS:localhost,IP:127.0.0.1"
 
-FROM alpine:latest
+FROM python:$PYTHON_VERSION-slim-bookworm
 
-LABEL org.opencontainers.image.source="https://github.com/PasarGuard/node"
+COPY --from=builder /build /code
+WORKDIR /code
 
-RUN apk update && apk add --no-cache wireguard-tools nftables iproute2 procps
+ENV PATH="/code/.venv/bin:$PATH"
 
-WORKDIR /app
-COPY --from=builder /src/main /app/main
-COPY --from=builder /usr/local/bin/xray /usr/local/bin/xray
-COPY --from=builder /usr/local/share/xray /usr/local/share/xray
-COPY --from=builder /src/certs /app/certs
+# Install curl for health checks
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
-ENV SSL_CERT_FILE=/app/certs/ssl_cert.pem
-ENV SSL_KEY_FILE=/app/certs/ssl_key.pem
-ENV NODE_HOST=0.0.0.0
-ENV SERVICE_PORT=62050
+COPY cli_wrapper.sh /usr/bin/pasarguard-cli
+RUN chmod +x /usr/bin/pasarguard-cli
 
-ENTRYPOINT ["./main"]
+COPY tui_wrapper.sh /usr/bin/pasarguard-tui
+RUN chmod +x /usr/bin/pasarguard-tui
+
+# Copy healthcheck script
+COPY healthcheck.sh /code/healthcheck.sh
+RUN chmod +x /code/healthcheck.sh
+
+RUN chmod +x /code/start.sh
+
+ENTRYPOINT ["/code/start.sh"]
